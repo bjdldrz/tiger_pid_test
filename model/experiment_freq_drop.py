@@ -58,8 +58,7 @@ DEFAULT_CONFIG = dict(
     batch_size=256,
     infer_size=96,
     lr=1e-4,
-    max_len=20,
-    # Eval
+    max_len=50,
     topk_list=[5, 10, 20],
     beam_size=20,
     # Paths

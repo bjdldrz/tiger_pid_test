@@ -54,7 +54,7 @@ MODEL_CONFIG = dict(
     pad_token_id=0, eos_token_id=0,
     feed_forward_proj='relu',
     batch_size=256, infer_size=96,
-    lr=1e-4, max_len=20,
+    lr=1e-4, max_len=50,
     topk_list=[5, 10, 20], beam_size=30,
     seed=2025,
 )
