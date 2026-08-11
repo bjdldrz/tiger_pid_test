@@ -198,15 +198,19 @@ train_df.to_parquet(OUT_DIR / 'train.parquet', index=False, engine='fastparquet'
 valid_df.to_parquet(OUT_DIR / 'valid.parquet', index=False, engine='fastparquet')
 test_df.to_parquet(OUT_DIR / 'test.parquet',   index=False, engine='fastparquet')
 
-# test_good: 去掉 bottom 20% reward 的测试样本（target_reward < 20th percentile）
-# 用于评估模型对高质量互动的召回情况
-test_reward_20pct = test_df['target_reward'].quantile(0.2)
-test_good_df = test_df[test_df['target_reward'] >= test_reward_20pct].copy()
-test_good_df.to_parquet(OUT_DIR / 'test_good.parquet', index=False, engine='fastparquet')
+# 使用统一阈值 0.2（与训练过滤对齐）分割 test_good / test_bad
+# test_good: target_reward >= 0.2（top 80%）→ 评估对高质量互动的召回
+# test_bad:  target_reward <  0.2（bottom 20%）→ 评估对低质量互动的召回
+GOOD_THRESHOLD = 0.2
+test_good_df = test_df[test_df['target_reward'] >= GOOD_THRESHOLD].copy()
+test_bad_df  = test_df[test_df['target_reward'] <  GOOD_THRESHOLD].copy()
 
-print(f'  test (full):    {len(test_df):,} samples')
-print(f'  test_good (top80%): {len(test_good_df):,} samples  '
-      f'(reward >= {test_reward_20pct:.3f})')
+test_good_df.to_parquet(OUT_DIR / 'test_good.parquet', index=False, engine='fastparquet')
+test_bad_df.to_parquet( OUT_DIR / 'test_bad.parquet',  index=False, engine='fastparquet')
+
+print(f'  test (full):         {len(test_df):,} samples')
+print(f'  test_good (reward>={GOOD_THRESHOLD}): {len(test_good_df):,} samples')
+print(f'  test_bad  (reward<{GOOD_THRESHOLD}):  {len(test_bad_df):,} samples')
 print(f'  Saved to {OUT_DIR}')
 
 # ---------------------------------------------------------------------------

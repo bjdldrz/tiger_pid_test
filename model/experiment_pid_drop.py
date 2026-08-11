@@ -73,7 +73,7 @@ def parse_args():
 def run_experiment(filter_kwargs, tag, config, device,
                    total_pids, code_to_item, test_pid_set,
                    validation_dataloader, test_dataloader,
-                   test_good_dataloader=None):
+                   test_good_dataloader=None, test_bad_dataloader=None):
     set_seed(config['seed'])
     train_dataset = GenRecDataset(
         dataset_path=config['dataset_path'] + '/train.parquet',
@@ -98,6 +98,7 @@ def run_experiment(filter_kwargs, tag, config, device,
     best_val_ndcg = 0.0
     best_test_recalls = best_test_ndcgs = None
     best_test_good_recalls = best_test_good_ndcgs = None
+    best_test_bad_recalls  = best_test_bad_ndcgs  = None
     best_recalled_pids = set()
 
     for epoch in range(config['num_epochs']):
@@ -113,6 +114,10 @@ def run_experiment(filter_kwargs, tag, config, device,
             if test_good_dataloader is not None:
                 best_test_good_recalls, best_test_good_ndcgs, _ = evaluate(
                     model, test_good_dataloader,
+                    config['topk_list'], config['beam_size'], device)
+            if test_bad_dataloader is not None:
+                best_test_bad_recalls, best_test_bad_ndcgs, _ = evaluate(
+                    model, test_bad_dataloader,
                     config['topk_list'], config['beam_size'], device)
             os.makedirs(config['save_dir'], exist_ok=True)
             torch.save(model.state_dict(),
@@ -130,15 +135,18 @@ def run_experiment(filter_kwargs, tag, config, device,
         'total_pids': total_pids,
     }
     for k in config['topk_list']:
-        result[f'Recall@{k}'] = best_test_recalls[f'Recall@{k}'] if best_test_recalls else 0.0
-        result[f'NDCG@{k}'] = best_test_ndcgs[f'NDCG@{k}'] if best_test_ndcgs else 0.0
+        result[f'Recall@{k}']      = best_test_recalls[f'Recall@{k}'] if best_test_recalls else 0.0
+        result[f'NDCG@{k}']        = best_test_ndcgs[f'NDCG@{k}']    if best_test_ndcgs    else 0.0
         if best_test_good_recalls:
             result[f'Good_Recall@{k}'] = best_test_good_recalls[f'Recall@{k}']
             result[f'Good_NDCG@{k}']   = best_test_good_ndcgs[f'NDCG@{k}']
+        if best_test_bad_recalls:
+            result[f'Bad_Recall@{k}']  = best_test_bad_recalls[f'Recall@{k}']
+            result[f'Bad_NDCG@{k}']    = best_test_bad_ndcgs[f'NDCG@{k}']
     print(f"[{tag}] recalled_pid_cov={recalled_pid_coverage:.4f} "
           f"Recall@10={result['Recall@10']:.4f}"
-          + (f" Good_Recall@10={result.get('Good_Recall@10', 0):.4f}"
-             if best_test_good_recalls else ""))
+          + (f" Good@10={result.get('Good_Recall@10', 0):.4f}" if best_test_good_recalls else "")
+          + (f" Bad@10={result.get('Bad_Recall@10',  0):.4f}" if best_test_bad_recalls  else ""))
     return result
 
 
@@ -167,16 +175,18 @@ def main():
     test_dl  = GenRecDataLoader(test_ds,  int(config['infer_size']), shuffle=False)
     test_pid_set = test_ds.get_train_pid_set()
 
-    # test_good: top-80% reward test set (if available)
-    test_good_path = dc['dataset_path'] + '/test_good.parquet'
-    test_good_dl = None
-    if os.path.exists(test_good_path):
-        test_good_ds = GenRecDataset(test_good_path,
-                                     config['code_path'], 'evaluation', config['max_len'])
-        test_good_dl = GenRecDataLoader(test_good_ds, int(config['infer_size']), shuffle=False)
-        logging.info(f"Loaded test_good: {len(test_good_ds)} samples")
-    else:
-        logging.warning("test_good.parquet not found, skipping good-only evaluation")
+    # test_good (reward >= 0.2) / test_bad (reward < 0.2)
+    def _load_split_dl(fname):
+        path = dc['dataset_path'] + f'/{fname}'
+        if not os.path.exists(path):
+            logging.warning(f"{fname} not found, skipping")
+            return None
+        ds = GenRecDataset(path, config['code_path'], 'evaluation', config['max_len'])
+        logging.info(f"Loaded {fname}: {len(ds)} samples")
+        return GenRecDataLoader(ds, int(config['infer_size']), shuffle=False)
+
+    test_good_dl = _load_split_dl('test_good.parquet')
+    test_bad_dl  = _load_split_dl('test_bad.parquet')
 
     all_results = []
 
@@ -186,7 +196,7 @@ def main():
         logging.info("No baseline found, training baseline...")
         baseline = run_experiment({}, 'baseline', config, device,
                                   total_pids, code_to_item, test_pid_set,
-                                  valid_dl, test_dl, test_good_dl)
+                                  valid_dl, test_dl, test_good_dl, test_bad_dl)
         save_baseline(baseline, dc['baseline_path'])
     all_results.append(baseline)
 
@@ -195,7 +205,8 @@ def main():
         tag = f'pid_keep_{int(ratio*100):03d}pct'
         result = run_experiment(
             {'pid_keep_ratio': ratio}, tag, config, device,
-            total_pids, code_to_item, test_pid_set, valid_dl, test_dl, test_good_dl)
+            total_pids, code_to_item, test_pid_set, valid_dl, test_dl,
+            test_good_dl, test_bad_dl)
         all_results.append(result)
         df = pd.DataFrame(all_results)
         df.to_csv(config['results_path'], index=False)
