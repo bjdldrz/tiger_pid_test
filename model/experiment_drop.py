@@ -1,28 +1,26 @@
 """
 experiment_drop.py
 ==================
-验证实验：随机 Drop 训练样本对 PID 覆盖率与 Recall@K 的影响。
+实验 A：随机 Drop 训练样本，验证样本量减少对 Recall@K 的影响。
 
-实验逻辑：
-  对训练集按 DROP_RATIOS 中的不同比例随机丢弃样本，
-  每个比例独立训练一个 T5 模型（固定随机种子，确保可复现），
-  在完整测试集上评估，同时统计：
-    - 训练集 target PID 覆盖率
-    - 模型 beam search 能生成的 PID 覆盖率（召回PID覆盖率）
-    - Recall@5 / Recall@10 / Recall@20
-    - NDCG@5 / NDCG@10 / NDCG@20
+Drop 方式：随机丢弃 20% 训练样本（交互记录粒度）
+对比组  ：baseline（无 drop）
 
-结果保存至：../results/drop_experiment.csv
+Baseline 复用：
+  若 results/{dataset}_baseline.json 已存在，直接加载，不重复训练。
+  所有三个实验共享同一份 baseline。
+
+多 GPU：自动检测，DataParallel 透明包装。
 
 使用方法：
   cd model
-  python experiment_drop.py [--epochs 50] [--device cuda]
+  python experiment_drop.py [--epochs 50] [--device cuda] [--dataset Beauty]
+  python experiment_drop.py --drop_ratios 0.2 0.4   # 不含 0.0，使用已有 baseline
 """
 
 import argparse
 import logging
 import os
-import random
 import sys
 
 import numpy as np
@@ -32,134 +30,124 @@ import torch.optim as optim
 
 from dataset import GenRecDataset, item2code
 from dataloader import GenRecDataLoader
-from main import TIGER, train, evaluate, set_seed
+from main import (TIGER, train, evaluate, set_seed,
+                  setup_device, wrap_model_multigpu,
+                  save_baseline, load_baseline)
 
 # ---------------------------------------------------------------------------
-# Experiment configuration
+# Defaults
 # ---------------------------------------------------------------------------
-DROP_RATIOS = [0.0, 0.2, 0.4, 0.6, 0.8]
+DROP_RATIOS = [0.2]   # baseline (0.0) is auto-handled separately
 
-DEFAULT_CONFIG = dict(
-    # Model
-    num_layers=4,
-    num_decoder_layers=4,
-    d_model=128,
-    d_ff=1024,
-    num_heads=6,
-    d_kv=64,
-    dropout_rate=0.1,
-    vocab_size=1025,
-    pad_token_id=0,
-    eos_token_id=0,
+DATASET_CONFIGS = {
+    'Beauty': {
+        'dataset_path': '../data/Beauty',
+        'code_path': '../data/Beauty/Beauty_t5_rqvae.npy',
+        'results_path': '../results/Beauty_drop_experiment.csv',
+        'baseline_path': '../results/Beauty_baseline.json',
+        'log_path': '../results/Beauty_drop_experiment.log',
+        'save_dir': '../results/Beauty_drop_ckpts',
+    },
+    'VK-LSVD': {
+        'dataset_path': '../data/VK-LSVD/processed',
+        'code_path': '../data/VK-LSVD/processed/VK_rqvae.npy',
+        'results_path': '../results/VK_drop_experiment.csv',
+        'baseline_path': '../results/VK_baseline.json',
+        'log_path': '../results/VK_drop_experiment.log',
+        'save_dir': '../results/VK_drop_ckpts',
+    },
+}
+
+MODEL_CONFIG = dict(
+    num_layers=4, num_decoder_layers=4,
+    d_model=128, d_ff=1024, num_heads=6, d_kv=64,
+    dropout_rate=0.1, vocab_size=1025,
+    pad_token_id=0, eos_token_id=0,
     feed_forward_proj='relu',
-    # Training
-    batch_size=256,
-    infer_size=96,
-    lr=1e-4,
-    max_len=20,
-    # Eval
-    topk_list=[5, 10, 20],
-    beam_size=30,
-    # Paths
-    dataset_path='../data/Beauty',
-    code_path='../data/Beauty/Beauty_t5_rqvae.npy',
-    results_path='../results/drop_experiment.csv',
-    save_dir='../results/drop_ckpts',
-    log_path='../results/drop_experiment.log',
-    # Reproducibility
+    batch_size=256, infer_size=96,
+    lr=1e-4, max_len=20,
+    topk_list=[5, 10, 20], beam_size=30,
     seed=2025,
 )
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Drop-ratio experiment for TIGER")
-    parser.add_argument('--epochs', type=int, default=50,
-                        help='Training epochs per run (default: 50 for quick validation)')
-    parser.add_argument('--device', type=str, default='mps',
-                        help='Device: cuda, mps, or cpu')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset', type=str, default='Beauty',
+                        choices=list(DATASET_CONFIGS.keys()))
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--drop_ratios', type=float, nargs='+', default=DROP_RATIOS,
-                        help='List of drop ratios to test')
+                        help='Drop ratios to test (baseline 0.0 is handled automatically)')
     return parser.parse_args()
 
 
-def run_single_experiment(drop_ratio, config, device, total_pids, code_to_item,
-                           validation_dataloader, test_dataloader, test_pid_set=None):
-    """Train one model with the given drop_ratio and return metrics."""
-    logging.info(f"\n{'='*60}")
-    logging.info(f"Starting experiment: drop_ratio={drop_ratio:.1f}")
-    logging.info(f"{'='*60}")
-
+def run_experiment(filter_kwargs, tag, config, device,
+                   total_pids, code_to_item, test_pid_set,
+                   validation_dataloader, test_dataloader):
+    """Train one model with given filter kwargs and return metrics dict."""
     set_seed(config['seed'])
 
-    # Build training dataset with drop
     train_dataset = GenRecDataset(
         dataset_path=config['dataset_path'] + '/train.parquet',
         code_path=config['code_path'],
         mode='train',
         max_len=config['max_len'],
-        drop_ratio=drop_ratio,
         seed=config['seed'],
+        **filter_kwargs,
     )
 
-    train_pid_coverage = train_dataset.get_train_pid_coverage(total_pids)
     n_train = len(train_dataset)
-    # Coverage over test set: how many test-target PIDs appear in training
     train_pid_set = train_dataset.get_train_pid_set()
-    if test_pid_set:
-        train_coverage_over_test = len(train_pid_set & test_pid_set) / len(test_pid_set)
-    else:
-        train_coverage_over_test = None
-    logging.info(
-        f"Train samples: {n_train}  |  Train PID coverage (all): {train_pid_coverage:.4f}  "
-        f"|  Train coverage over test: {train_coverage_over_test:.4f}"
-    )
-    print(f"[drop={drop_ratio:.1f}] train_samples={n_train}, pid_coverage={train_pid_coverage:.4f}, "
+    train_pid_coverage = len(train_pid_set) / total_pids
+    train_coverage_over_test = len(train_pid_set & test_pid_set) / len(test_pid_set)
+
+    logging.info(f"[{tag}] samples={n_train}, pid_cov={train_pid_coverage:.4f}, "
+                 f"cov_over_test={train_coverage_over_test:.4f}")
+    print(f"[{tag}] samples={n_train}, pid_coverage={train_pid_coverage:.4f}, "
           f"coverage_over_test={train_coverage_over_test:.4f}")
 
-    train_dataloader = GenRecDataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
+    train_dataloader = GenRecDataLoader(
+        train_dataset, batch_size=config['batch_size'], shuffle=True
+    )
 
-    # Initialize model
-    model = TIGER(config).to(device)
+    model = TIGER(config)
+    model = wrap_model_multigpu(model, device)
     optimizer = optim.Adam(model.parameters(), lr=config['lr'])
 
-    # Training loop
     best_val_ndcg = 0.0
-    best_test_recalls = None
-    best_test_ndcgs = None
+    best_test_recalls = best_test_ndcgs = None
     best_recalled_pids = set()
 
     for epoch in range(config['num_epochs']):
-        train_loss = train(model, train_dataloader, optimizer, device)
-        avg_recalls, avg_ndcgs, _ = evaluate(
+        loss = train(model, train_dataloader, optimizer, device)
+        recalls, ndcgs, _ = evaluate(
             model, validation_dataloader,
-            config['topk_list'], config['beam_size'], device,
-            code_to_item=None  # skip PID tracking on validation for speed
+            config['topk_list'], config['beam_size'], device
         )
-        val_ndcg20 = avg_ndcgs['NDCG@20']
-        logging.info(f"Epoch {epoch+1}/{config['num_epochs']} | loss={train_loss:.4f} | val_NDCG@20={val_ndcg20:.4f}")
+        val_ndcg20 = ndcgs['NDCG@20']
+        logging.info(f"  epoch {epoch+1}/{config['num_epochs']} loss={loss:.4f} val_NDCG@20={val_ndcg20:.4f}")
 
         if val_ndcg20 > best_val_ndcg:
             best_val_ndcg = val_ndcg20
-            # Evaluate on test with PID tracking
             best_test_recalls, best_test_ndcgs, best_recalled_pids = evaluate(
                 model, test_dataloader,
                 config['topk_list'], config['beam_size'], device,
                 code_to_item=code_to_item
             )
-            logging.info(f"  New best! test_Recall@10={best_test_recalls['Recall@10']:.4f}")
-
-            # Save checkpoint
             os.makedirs(config['save_dir'], exist_ok=True)
-            ckpt_path = os.path.join(config['save_dir'], f"drop{int(drop_ratio*100):03d}.pth")
-            torch.save(model.state_dict(), ckpt_path)
+            torch.save(
+                model.state_dict(),
+                os.path.join(config['save_dir'], f"{tag}.pth")
+            )
+            logging.info(f"  new best Recall@10={best_test_recalls['Recall@10']:.4f}")
 
     recalled_pid_coverage = len(best_recalled_pids) / total_pids
-
     result = {
-        'drop_ratio': drop_ratio,
+        'experiment': tag,
         'n_train_samples': n_train,
-        'train_pid_coverage': train_pid_coverage,           # train target PIDs / all items
-        'train_coverage_over_test': train_coverage_over_test,  # train target PIDs ∩ test target PIDs / test target PIDs
+        'train_pid_coverage': train_pid_coverage,
+        'train_coverage_over_test': train_coverage_over_test,
         'recalled_pid_coverage': recalled_pid_coverage,
         'recalled_pid_count': len(best_recalled_pids),
         'total_pids': total_pids,
@@ -168,89 +156,79 @@ def run_single_experiment(drop_ratio, config, device, total_pids, code_to_item,
         result[f'Recall@{k}'] = best_test_recalls[f'Recall@{k}'] if best_test_recalls else 0.0
         result[f'NDCG@{k}'] = best_test_ndcgs[f'NDCG@{k}'] if best_test_ndcgs else 0.0
 
-    logging.info(f"Result: {result}")
-    print(f"[drop={drop_ratio:.1f}] recalled_pid_coverage={recalled_pid_coverage:.4f}, "
+    print(f"[{tag}] recalled_pid_cov={recalled_pid_coverage:.4f} "
           f"Recall@10={result['Recall@10']:.4f}")
     return result
 
 
 def main():
     args = parse_args()
-    config = dict(DEFAULT_CONFIG)
-    config['num_epochs'] = args.epochs
-    config['device'] = args.device
+    dc = DATASET_CONFIGS[args.dataset]
+    config = {**MODEL_CONFIG, **dc,
+              'num_epochs': args.epochs, 'device': args.device}
 
-    os.makedirs(os.path.dirname(config['log_path']), exist_ok=True)
+    os.makedirs(os.path.dirname(dc['log_path']), exist_ok=True)
     logging.basicConfig(
-        filename=config['log_path'],
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
+        filename=dc['log_path'], level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(message)s'
     )
-    # Also log to stdout
     logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
 
-    if config['device'] == 'cuda' and torch.cuda.is_available():
-        device = torch.device('cuda')
-    elif config['device'] == 'mps' and torch.backends.mps.is_available():
-        device = torch.device('mps')
-    else:
-        device = torch.device('cpu')
-    logging.info(f"Using device: {device}")
-    logging.info(f"Config: {config}")
+    device = setup_device(args.device)
+    n_gpus = torch.cuda.device_count() if device.type == 'cuda' else 0
+    logging.info(f"device={device}, GPUs={n_gpus}, dataset={args.dataset}")
 
-    # Load item→code mapping (shared across all runs)
     item_to_code, code_to_item = item2code(config['code_path'])
     total_pids = len(item_to_code)
-    logging.info(f"Total PIDs: {total_pids}")
 
-    # Build validation and test dataloaders (shared, no drop)
-    validation_dataset = GenRecDataset(
-        dataset_path=config['dataset_path'] + '/valid.parquet',
-        code_path=config['code_path'],
-        mode='evaluation',
-        max_len=config['max_len'],
-    )
-    test_dataset = GenRecDataset(
-        dataset_path=config['dataset_path'] + '/test.parquet',
-        code_path=config['code_path'],
-        mode='evaluation',
-        max_len=config['max_len'],
-    )
-    validation_dataloader = GenRecDataLoader(validation_dataset, batch_size=config['infer_size'], shuffle=False)
-    test_dataloader = GenRecDataLoader(test_dataset, batch_size=config['infer_size'], shuffle=False)
+    valid_ds = GenRecDataset(dc['dataset_path'] + '/valid.parquet',
+                             config['code_path'], 'evaluation', config['max_len'])
+    test_ds  = GenRecDataset(dc['dataset_path'] + '/test.parquet',
+                             config['code_path'], 'evaluation', config['max_len'])
+    valid_dl = GenRecDataLoader(valid_ds, int(config['infer_size']), shuffle=False)
+    test_dl  = GenRecDataLoader(test_ds,  int(config['infer_size']), shuffle=False)
+    test_pid_set = test_ds.get_train_pid_set()
 
-    # Run experiments
     all_results = []
-    # Pre-compute test target PID set (used for coverage_over_test metric)
-    test_pid_set = test_dataset.get_train_pid_set()
-    logging.info(f"Unique test target PIDs: {len(test_pid_set)}")
 
-    for drop_ratio in args.drop_ratios:
-        result = run_single_experiment(
-            drop_ratio=drop_ratio,
-            config=config,
-            device=device,
-            total_pids=total_pids,
-            code_to_item=code_to_item,
-            validation_dataloader=validation_dataloader,
-            test_dataloader=test_dataloader,
+    # ---- Baseline (drop_ratio=0.0): load or train once ----
+    baseline = load_baseline(dc['baseline_path'])
+    if baseline is None:
+        logging.info("No baseline found, training baseline now...")
+        baseline = run_experiment(
+            filter_kwargs={},
+            tag='baseline',
+            config=config, device=device,
+            total_pids=total_pids, code_to_item=code_to_item,
             test_pid_set=test_pid_set,
+            validation_dataloader=valid_dl, test_dataloader=test_dl,
+        )
+        save_baseline(baseline, dc['baseline_path'])
+    else:
+        logging.info("Baseline loaded from cache, skipping training.")
+
+    all_results.append(baseline)
+
+    # ---- Drop experiments ----
+    for drop_ratio in args.drop_ratios:
+        tag = f'drop_{int(drop_ratio*100):03d}pct'
+        result = run_experiment(
+            filter_kwargs={'drop_ratio': drop_ratio},
+            tag=tag,
+            config=config, device=device,
+            total_pids=total_pids, code_to_item=code_to_item,
+            test_pid_set=test_pid_set,
+            validation_dataloader=valid_dl, test_dataloader=test_dl,
         )
         all_results.append(result)
 
-        # Save intermediate results after each run
         df = pd.DataFrame(all_results)
         df.to_csv(config['results_path'], index=False)
-        print(f"\nResults saved to {config['results_path']}")
         print(df.to_string(index=False))
 
-    # Final summary
     df = pd.DataFrame(all_results)
     df.to_csv(config['results_path'], index=False)
-    logging.info("\n=== Final Results ===")
-    logging.info(df.to_string(index=False))
-    print("\n=== Experiment Complete ===")
-    print(df.to_string(index=False))
+    logging.info("=== experiment_drop complete ===\n" + df.to_string(index=False))
 
 
 if __name__ == '__main__':

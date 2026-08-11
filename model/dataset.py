@@ -88,7 +88,8 @@ def item2code(code_path, codebook_size=256):
 
 class GenRecDataset(Dataset):
     def __init__(self, dataset_path, code_path, mode, max_len,
-                 drop_ratio=0.0, pid_keep_ratio=1.0, seed=42, PAD_TOKEN=0):
+                 drop_ratio=0.0, pid_keep_ratio=1.0, freq_drop_ratio=0.0,
+                 reward_threshold=0.0, seed=42, PAD_TOKEN=0):
         """
         Initialize the GenRecDataset.
         Args:
@@ -101,7 +102,12 @@ class GenRecDataset(Dataset):
             pid_keep_ratio (float): Fraction of unique target PIDs to keep (0.0~1.0).
                                     Removes ALL samples whose target is a dropped PID.
                                     Only applied when mode='train'. Default: 1.0 (keep all PIDs).
-                                    Note: pid_keep_ratio is applied first, then drop_ratio.
+            freq_drop_ratio (float): Fraction of lowest-frequency target PIDs to remove (0.0~1.0).
+                                     Only applied when mode='train'. Default: 0.0 (no drop).
+            reward_threshold (float): Keep only samples whose 'target_reward' column value
+                                      >= reward_threshold. Simulates RSFT quality filtering.
+                                      Requires parquet to have a 'target_reward' column.
+                                      Only applied when mode='train'. Default: 0.0 (keep all).
             seed (int): Random seed for reproducible sampling. Default: 42.
             PAD_TOKEN (int, optional): Token used for padding. Defaults to 0.
         """
@@ -110,9 +116,11 @@ class GenRecDataset(Dataset):
         self.mode = mode
         self.max_len = max_len
         self.PAD_TOKEN = PAD_TOKEN
-        # drop_ratio and pid_keep_ratio only apply to train mode
+        # these filters only apply to train mode
         self.drop_ratio = drop_ratio if mode == 'train' else 0.0
         self.pid_keep_ratio = pid_keep_ratio if mode == 'train' else 1.0
+        self.freq_drop_ratio = freq_drop_ratio if mode == 'train' else 0.0
+        self.reward_threshold = reward_threshold if mode == 'train' else 0.0
         self.seed = seed
         # Load item-to-code mapping
         self.item_to_code, self.code_to_item = item2code(code_path)
@@ -130,6 +138,31 @@ class GenRecDataset(Dataset):
         processed_data = process_data(
             self.dataset_path, self.mode, self.max_len, self.PAD_TOKEN
         )
+
+        # Reward-based filtering: keep only samples with target_reward >= threshold
+        # Applied FIRST — quality filter before any random sub-sampling
+        if self.reward_threshold > 0.0:
+            before = len(processed_data)
+            processed_data = [item for item in processed_data
+                              if item.get('target_reward', 1.0) >= self.reward_threshold]
+            after = len(processed_data)
+            # Warn if no reward column found (all items have default 1.0)
+            if after == before and before > 0:
+                import warnings
+                warnings.warn(
+                    "reward_threshold > 0 but no 'target_reward' column found in data. "
+                    "All samples retained. Check your parquet file."
+                )
+
+        # Frequency-based tail drop: remove PIDs with lowest occurrence counts
+        # Applied FIRST so subsequent filters work on already-cleaned data
+        if self.freq_drop_ratio > 0.0:
+            from collections import Counter
+            pid_counts = Counter(item['target'] for item in processed_data)
+            sorted_pids = sorted(pid_counts.keys(), key=lambda p: pid_counts[p])
+            n_drop = int(len(sorted_pids) * self.freq_drop_ratio)
+            dropped_pids = set(sorted_pids[:n_drop])
+            processed_data = [item for item in processed_data if item['target'] not in dropped_pids]
 
         # PID-level drop: keep only pid_keep_ratio fraction of unique target PIDs
         # Applied BEFORE sample-level drop so PID coverage is precisely controlled

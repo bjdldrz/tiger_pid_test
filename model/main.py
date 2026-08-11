@@ -142,11 +142,14 @@ def train(model, train_loader, optimizer, device):
 
         optimizer.zero_grad()
         loss, _ = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        # DataParallel returns per-GPU losses; take the mean
+        if isinstance(loss, torch.Tensor) and loss.dim() > 0:
+            loss = loss.mean()
         loss.backward()
         optimizer.step()
 
         total_loss += loss.item()
-        
+
     return total_loss / len(train_loader)
 
 def evaluate(model, eval_loader, topk_list, beam_size, device, code_to_item=None):
@@ -178,7 +181,8 @@ def evaluate(model, eval_loader, topk_list, beam_size, device, code_to_item=None
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['target'].to(device)
 
-            preds = model.generate(input_ids=input_ids, attention_mask=attention_mask, num_beams=beam_size)
+            # Use unwrapped model for generation (DataParallel doesn't support generate)
+            preds = _unwrap(model).generate(input_ids=input_ids, attention_mask=attention_mask, num_beams=beam_size)
             preds = preds[:, 1:]  # Exclude the start token
             preds = preds.reshape(input_ids.shape[0], beam_size, -1)  # Reshape to (batch_size, beam_size, seq_len)
             pos_index = calculate_pos_index(preds, labels, maxk=beam_size)
@@ -210,6 +214,60 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def setup_device(device_str: str) -> torch.device:
+    """Resolve device string to a torch.device.
+    Supports 'cuda', 'cuda:0', 'mps', 'cpu'.
+    """
+    if device_str.startswith('cuda') and torch.cuda.is_available():
+        return torch.device(device_str)
+    elif device_str == 'mps' and torch.backends.mps.is_available():
+        return torch.device('mps')
+    else:
+        return torch.device('cpu')
+
+
+def wrap_model_multigpu(model: nn.Module, device: torch.device) -> nn.Module:
+    """Wrap model with DataParallel if multiple GPUs are available.
+
+    Usage:
+        model = TIGER(config)
+        model, device = wrap_model_multigpu(model, device)
+        # training as normal; model.module.generate() inside evaluate is handled automatically.
+
+    Returns the (possibly wrapped) model after moving to device.
+    """
+    model = model.to(device)
+    if device.type == 'cuda' and torch.cuda.device_count() > 1:
+        logging.info(f"Using {torch.cuda.device_count()} GPUs via DataParallel")
+        model = nn.DataParallel(model)
+    return model
+
+
+def _unwrap(model: nn.Module) -> nn.Module:
+    """Return the underlying module, unwrapping DataParallel if needed."""
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def save_baseline(result: dict, path: str):
+    """Persist baseline metrics to a JSON file for reuse across experiments."""
+    import json
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        json.dump(result, f, indent=2)
+    logging.info(f"Baseline saved to {path}")
+
+
+def load_baseline(path: str) -> dict:
+    """Load baseline metrics from a JSON file. Returns None if file not found."""
+    import json
+    if os.path.exists(path):
+        with open(path) as f:
+            result = json.load(f)
+        logging.info(f"Baseline loaded from {path}")
+        return result
+    return None
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TIGER configuration")

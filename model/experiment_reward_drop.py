@@ -1,14 +1,20 @@
 """
-experiment_pid_drop.py
-======================
-实验 B：随机 PID Drop，精确控制训练集 PID 覆盖率。
+experiment_reward_drop.py
+=========================
+实验 C：基于 reward 的质量过滤，模拟 RSFT 效果。
 
-Drop 方式：随机排除 20% target PID 及其所有训练样本
-对比组  ：baseline（复用 experiment_drop.py 生成的 baseline，不重复训练）
+Drop 方式：只保留 target_reward >= threshold 的训练样本（top 80% 完播率）
+对比组  ：baseline（复用已有 baseline，不重复训练）
+
+reward 字段：parquet 中的 'target_reward' 列（完播率分位数，0~1）
+  - threshold=0.2 → 保留 top 80%（去掉完播率最低的 20%）
+
+要求：train.parquet 必须包含 'target_reward' 列（VK-LSVD processed/ 已有）
 
 使用方法：
   cd model
-  python experiment_pid_drop.py [--epochs 50] [--device cuda] [--dataset Beauty]
+  python experiment_reward_drop.py [--epochs 50] [--device cuda] [--dataset VK-LSVD]
+  python experiment_reward_drop.py --reward_thresholds 0.2 0.4 0.6
 """
 
 import argparse
@@ -26,24 +32,25 @@ from main import (TIGER, train, evaluate, set_seed,
                   setup_device, wrap_model_multigpu,
                   save_baseline, load_baseline)
 
-PID_KEEP_RATIOS = [0.8]   # 保留 80% PID，即随机 drop 20% PID
+# threshold=0.2 means keep samples with reward >= 0.2 (top 80%)
+REWARD_THRESHOLDS = [0.2]
 
 DATASET_CONFIGS = {
     'Beauty': {
         'dataset_path': '../data/Beauty',
         'code_path': '../data/Beauty/Beauty_t5_rqvae.npy',
-        'results_path': '../results/Beauty_pid_drop_experiment.csv',
+        'results_path': '../results/Beauty_reward_drop_experiment.csv',
         'baseline_path': '../results/Beauty_baseline.json',
-        'log_path': '../results/Beauty_pid_drop_experiment.log',
-        'save_dir': '../results/Beauty_pid_drop_ckpts',
+        'log_path': '../results/Beauty_reward_drop_experiment.log',
+        'save_dir': '../results/Beauty_reward_drop_ckpts',
     },
     'VK-LSVD': {
         'dataset_path': '../data/VK-LSVD/processed',
         'code_path': '../data/VK-LSVD/processed/VK_rqvae.npy',
-        'results_path': '../results/VK_pid_drop_experiment.csv',
+        'results_path': '../results/VK_reward_drop_experiment.csv',
         'baseline_path': '../results/VK_baseline.json',
-        'log_path': '../results/VK_pid_drop_experiment.log',
-        'save_dir': '../results/VK_pid_drop_ckpts',
+        'log_path': '../results/VK_reward_drop_experiment.log',
+        'save_dir': '../results/VK_reward_drop_ckpts',
     },
 }
 
@@ -62,11 +69,14 @@ MODEL_CONFIG = dict(
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, default='Beauty',
+    parser.add_argument('--dataset', type=str, default='VK-LSVD',
                         choices=list(DATASET_CONFIGS.keys()))
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--pid_keep_ratios', type=float, nargs='+', default=PID_KEEP_RATIOS)
+    parser.add_argument('--reward_thresholds', type=float, nargs='+',
+                        default=REWARD_THRESHOLDS,
+                        help='Reward thresholds: keep samples with reward >= threshold. '
+                             '0.2 = keep top 80%%, 0.5 = keep top 50%%.')
     return parser.parse_args()
 
 
@@ -168,11 +178,12 @@ def main():
         save_baseline(baseline, dc['baseline_path'])
     all_results.append(baseline)
 
-    # ---- PID drop experiments ----
-    for ratio in args.pid_keep_ratios:
-        tag = f'pid_keep_{int(ratio*100):03d}pct'
+    # ---- Reward threshold experiments ----
+    for threshold in args.reward_thresholds:
+        pct_keep = int((1 - threshold) * 100)
+        tag = f'reward_top{pct_keep:03d}pct'
         result = run_experiment(
-            {'pid_keep_ratio': ratio}, tag, config, device,
+            {'reward_threshold': threshold}, tag, config, device,
             total_pids, code_to_item, test_pid_set, valid_dl, test_dl)
         all_results.append(result)
         df = pd.DataFrame(all_results)
@@ -180,7 +191,7 @@ def main():
         print(df.to_string(index=False))
 
     pd.DataFrame(all_results).to_csv(config['results_path'], index=False)
-    logging.info("=== experiment_pid_drop complete ===")
+    logging.info("=== experiment_reward_drop complete ===")
 
 
 if __name__ == '__main__':
