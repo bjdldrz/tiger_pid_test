@@ -121,6 +121,11 @@ class Trainer(object):
             self.optimizer.zero_grad()
             out, rq_loss, indices = self.model(data)
             loss, loss_recon = self._unwrap_model().compute_loss(out, rq_loss, xs=data)
+            # DataParallel returns per-GPU losses; reduce to scalar
+            if loss.dim() > 0:
+                loss = loss.mean()
+            if loss_recon.dim() > 0:
+                loss_recon = loss_recon.mean()
             self._check_nan(loss)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
