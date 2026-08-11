@@ -84,7 +84,8 @@ def parse_args():
 
 def run_experiment(filter_kwargs, tag, config, device,
                    total_pids, code_to_item, test_pid_set,
-                   validation_dataloader, test_dataloader):
+                   validation_dataloader, test_dataloader,
+                   test_good_dataloader=None):
     """Train one model with given filter kwargs and return metrics dict."""
     set_seed(config['seed'])
 
@@ -117,6 +118,7 @@ def run_experiment(filter_kwargs, tag, config, device,
 
     best_val_ndcg = 0.0
     best_test_recalls = best_test_ndcgs = None
+    best_test_good_recalls = best_test_good_ndcgs = None
     best_recalled_pids = set()
 
     for epoch in range(config['num_epochs']):
@@ -135,6 +137,11 @@ def run_experiment(filter_kwargs, tag, config, device,
                 config['topk_list'], config['beam_size'], device,
                 code_to_item=code_to_item
             )
+            if test_good_dataloader is not None:
+                best_test_good_recalls, best_test_good_ndcgs, _ = evaluate(
+                    model, test_good_dataloader,
+                    config['topk_list'], config['beam_size'], device
+                )
             os.makedirs(config['save_dir'], exist_ok=True)
             torch.save(
                 model.state_dict(),
@@ -155,9 +162,14 @@ def run_experiment(filter_kwargs, tag, config, device,
     for k in config['topk_list']:
         result[f'Recall@{k}'] = best_test_recalls[f'Recall@{k}'] if best_test_recalls else 0.0
         result[f'NDCG@{k}'] = best_test_ndcgs[f'NDCG@{k}'] if best_test_ndcgs else 0.0
+        if best_test_good_recalls:
+            result[f'Good_Recall@{k}'] = best_test_good_recalls[f'Recall@{k}']
+            result[f'Good_NDCG@{k}']   = best_test_good_ndcgs[f'NDCG@{k}']
 
     print(f"[{tag}] recalled_pid_cov={recalled_pid_coverage:.4f} "
-          f"Recall@10={result['Recall@10']:.4f}")
+          f"Recall@10={result['Recall@10']:.4f}"
+          + (f" Good_Recall@10={result.get('Good_Recall@10', 0):.4f}"
+             if best_test_good_recalls else ""))
     return result
 
 
@@ -189,6 +201,17 @@ def main():
     test_dl  = GenRecDataLoader(test_ds,  int(config['infer_size']), shuffle=False)
     test_pid_set = test_ds.get_train_pid_set()
 
+    # test_good: top-80% reward test set (if available)
+    test_good_path = dc['dataset_path'] + '/test_good.parquet'
+    test_good_dl = None
+    if os.path.exists(test_good_path):
+        test_good_ds = GenRecDataset(test_good_path,
+                                     config['code_path'], 'evaluation', config['max_len'])
+        test_good_dl = GenRecDataLoader(test_good_ds, int(config['infer_size']), shuffle=False)
+        logging.info(f"Loaded test_good: {len(test_good_ds)} samples")
+    else:
+        logging.warning("test_good.parquet not found, skipping good-only evaluation")
+
     all_results = []
 
     # ---- Baseline (drop_ratio=0.0): load or train once ----
@@ -202,6 +225,7 @@ def main():
             total_pids=total_pids, code_to_item=code_to_item,
             test_pid_set=test_pid_set,
             validation_dataloader=valid_dl, test_dataloader=test_dl,
+            test_good_dataloader=test_good_dl,
         )
         save_baseline(baseline, dc['baseline_path'])
     else:
@@ -219,6 +243,7 @@ def main():
             total_pids=total_pids, code_to_item=code_to_item,
             test_pid_set=test_pid_set,
             validation_dataloader=valid_dl, test_dataloader=test_dl,
+            test_good_dataloader=test_good_dl,
         )
         all_results.append(result)
 

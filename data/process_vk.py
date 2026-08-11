@@ -197,6 +197,16 @@ print('[7/8] Saving parquet files...')
 train_df.to_parquet(OUT_DIR / 'train.parquet', index=False, engine='fastparquet')
 valid_df.to_parquet(OUT_DIR / 'valid.parquet', index=False, engine='fastparquet')
 test_df.to_parquet(OUT_DIR / 'test.parquet',   index=False, engine='fastparquet')
+
+# test_good: 去掉 bottom 20% reward 的测试样本（target_reward < 20th percentile）
+# 用于评估模型对高质量互动的召回情况
+test_reward_20pct = test_df['target_reward'].quantile(0.2)
+test_good_df = test_df[test_df['target_reward'] >= test_reward_20pct].copy()
+test_good_df.to_parquet(OUT_DIR / 'test_good.parquet', index=False, engine='fastparquet')
+
+print(f'  test (full):    {len(test_df):,} samples')
+print(f'  test_good (top80%): {len(test_good_df):,} samples  '
+      f'(reward >= {test_reward_20pct:.3f})')
 print(f'  Saved to {OUT_DIR}')
 
 # ---------------------------------------------------------------------------
