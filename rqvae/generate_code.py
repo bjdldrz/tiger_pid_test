@@ -77,11 +77,24 @@ if cli_args.ckpt_path:
 else:
     ckpt_dir = cfg['ckpt_dir']
     if os.path.isdir(ckpt_dir):
-        subdirs = sorted(os.listdir(ckpt_dir))
-        if subdirs:
-            ckpt_path = os.path.join(ckpt_dir, subdirs[-1], 'best_collision_model.pth')
+        # Recursively find all best_collision_model.pth under ckpt_dir,
+        # pick the most recently modified one
+        candidates = []
+        for root, dirs, files in os.walk(ckpt_dir):
+            if 'best_collision_model.pth' in files:
+                p = os.path.join(root, 'best_collision_model.pth')
+                candidates.append((os.path.getmtime(p), p))
+        if candidates:
+            candidates.sort(reverse=True)
+            ckpt_path = candidates[0][1]
+            print(f"Auto-selected checkpoint: {ckpt_path}")
         else:
-            raise FileNotFoundError(f"No checkpoint found in {ckpt_dir}")
+            raise FileNotFoundError(
+                f"No best_collision_model.pth found under {ckpt_dir}\n"
+                f"Please train RQ-VAE first:\n"
+                f"  cd rqvae && python main.py --data_path {cfg['data_path']} "
+                f"--ckpt_dir {ckpt_dir}"
+            )
     else:
         raise FileNotFoundError(
             f"Checkpoint directory not found: {ckpt_dir}\n"
