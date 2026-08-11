@@ -8,42 +8,19 @@ def process_data(file_path, mode, max_len, PAD_TOKEN=0):
     """
     Process parquet data based on mode ('train' or 'evaluation').
 
-    Args:
-        file_path (str): Path to the parquet file.
-        mode (str): Mode of operation ('train' or 'evaluation').
-        max_len (int): Maximum length for padding or truncation.
+    For train mode: parquet already contains pre-computed (history, target) pairs
+    from sliding-window splits done in process_vk.py / process_beauty.py.
+    We use them directly WITHOUT re-applying sliding window to avoid OOM.
 
-    Returns:
-        list: Processed data.
+    For evaluation mode: same structure, use history as-is and target as label.
     """
-    # Load parquet data
     data = pd.read_parquet(file_path, engine='fastparquet')
 
-    # Combine "history" and "target" columns into a single sequence
-    # Important: Ensure 'history' is a list and 'target' is appended correctly
-    data['sequence'] = data['history'].apply(lambda x: list(x)) + data['target'].apply(lambda x: [x])
-
-    if mode == 'train':
-        # Sliding window processing
-        processed_data = []
-        for row in data.itertuples(index=False):
-            sequence = row.sequence
-            for i in range(1, len(sequence)):
-                processed_data.append({
-                    'history': sequence[:i],
-                    'target': sequence[i]
-                })
-    elif mode == 'evaluation':
-        # Use the last item as target and the rest as history
-        processed_data = []
-        for row in data.itertuples(index=False):
-            sequence = row.sequence
-            processed_data.append({
-                'history': sequence[:-1],
-                'target': sequence[-1]
-            })
-    else:
-        raise ValueError("Mode must be 'train' or 'evaluation'.")
+    processed_data = []
+    for row in data.itertuples(index=False):
+        history = list(row.history)
+        target  = row.target
+        processed_data.append({'history': history, 'target': target})
 
     # Apply padding or truncation
     for item in processed_data:
