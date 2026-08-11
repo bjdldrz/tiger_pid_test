@@ -119,7 +119,7 @@ print(f"Using device: {device}")
 # ---------------------------------------------------------------------------
 # Load checkpoint and model
 # ---------------------------------------------------------------------------
-ckpt = torch.load(ckpt_path, map_location=torch.device('cpu'))
+ckpt = torch.load(ckpt_path, map_location=torch.device('cpu'), weights_only=False)
 args = ckpt["args"]
 state_dict = ckpt["state_dict"]
 
