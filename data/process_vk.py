@@ -214,41 +214,42 @@ print(f'  test_bad  (reward<{GOOD_THRESHOLD}):  {len(test_bad_df):,} samples')
 print(f'  Saved to {OUT_DIR}')
 
 # ---------------------------------------------------------------------------
-# Step 8: 提取 item embedding 子集，保存为 item_emb.parquet
+# Step 8: 提取 item embedding 子集，保存为 item_emb.npy
 # ---------------------------------------------------------------------------
 print('[8/8] Extracting item embeddings for filtered items...')
-emb_data = np.load(DATA_DIR / 'item_embeddings.npz')
-emb_item_ids  = emb_data['item_id']   # shape: (19627601,)
-emb_vectors   = emb_data['embedding'] # shape: (19627601, 64), float16
+item_emb_path = OUT_DIR / 'item_emb.npy'
+if item_emb_path.exists():
+    print(f'  item_emb.npy already exists, skipping extraction.')
+else:
+    emb_data = np.load(DATA_DIR / 'item_embeddings.npz')
+    emb_item_ids  = emb_data['item_id']   # shape: (19627601,)
+    emb_vectors   = emb_data['embedding'] # shape: (19627601, 64), float16
 
-# 建立 item_id → embedding 的查找表
-print('  Building embedding lookup...')
-emb_id2idx = {int(v): i for i, v in enumerate(emb_item_ids)}
+    # 建立 item_id → embedding 的查找表
+    print('  Building embedding lookup...')
+    emb_id2idx = {int(v): i for i, v in enumerate(emb_item_ids)}
 
-# 按照 item_mapping 的顺序提取 embedding（item_mapping 中索引 i 对应 item2idx=i+1）
-embeddings_out = []
-missing = 0
-for orig_item_id in unique_items:
-    if int(orig_item_id) in emb_id2idx:
-        idx = emb_id2idx[int(orig_item_id)]
-        embeddings_out.append(emb_vectors[idx].astype(np.float32))
-    else:
-        # 用零向量填充（罕见情况）
-        embeddings_out.append(np.zeros(64, dtype=np.float32))
-        missing += 1
+    # 按照 item_mapping 的顺序提取 embedding（item_mapping 中索引 i 对应 item2idx=i+1）
+    embeddings_out = []
+    missing = 0
+    for orig_item_id in unique_items:
+        if int(orig_item_id) in emb_id2idx:
+            idx = emb_id2idx[int(orig_item_id)]
+            embeddings_out.append(emb_vectors[idx].astype(np.float32))
+        else:
+            # 用零向量填充（罕见情况）
+            embeddings_out.append(np.zeros(64, dtype=np.float32))
+            missing += 1
 
-embeddings_out = np.array(embeddings_out)  # shape: (n_items, 64)
-print(f'  Embeddings shape: {embeddings_out.shape}, missing: {missing}')
+    embeddings_out = np.array(embeddings_out)  # shape: (n_items, 64)
+    print(f'  Embeddings shape: {embeddings_out.shape}, missing: {missing}')
 
-# 保存为 npy（shape: n_items x 64）和一个 mapping csv
-# fastparquet 无法保存 numpy array 列，改用 npy
-np.save(OUT_DIR / 'item_emb.npy', embeddings_out)
-# 额外保存 item_idx → item_id_orig 的映射 csv（调试用）
-pd.DataFrame({
-    'item_idx': list(range(1, n_items + 1)),
-    'item_id_orig': unique_items,
-}).to_csv(OUT_DIR / 'item_idx_map.csv', index=False)
-print(f'  Saved item_emb.npy (shape={embeddings_out.shape})')
+    np.save(item_emb_path, embeddings_out)
+    pd.DataFrame({
+        'item_idx': list(range(1, n_items + 1)),
+        'item_id_orig': unique_items,
+    }).to_csv(OUT_DIR / 'item_idx_map.csv', index=False)
+    print(f'  Saved item_emb.npy (shape={embeddings_out.shape})')
 
 # ---------------------------------------------------------------------------
 # 完成
