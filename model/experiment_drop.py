@@ -75,7 +75,9 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default='Beauty',
                         choices=list(DATASET_CONFIGS.keys()))
-    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--patience', type=int, default=20,
+                        help='Early stopping patience (epochs without val NDCG@20 improvement)')
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--drop_ratios', type=float, nargs='+', default=DROP_RATIOS,
                         help='Drop ratios to test (baseline 0.0 is handled automatically)')
@@ -121,6 +123,7 @@ def run_experiment(filter_kwargs, tag, config, device,
     best_test_good_recalls = best_test_good_ndcgs = None
     best_test_bad_recalls  = best_test_bad_ndcgs  = None
     best_recalled_pids = set()
+    no_improve_count = 0
 
     for epoch in range(config['num_epochs']):
         loss = train(model, train_dataloader, optimizer, device)
@@ -129,10 +132,11 @@ def run_experiment(filter_kwargs, tag, config, device,
             config['topk_list'], config['beam_size'], device
         )
         val_ndcg20 = ndcgs['NDCG@20']
-        logging.info(f"  epoch {epoch+1}/{config['num_epochs']} loss={loss:.4f} val_NDCG@20={val_ndcg20:.4f}")
+        logging.info(f"  epoch {epoch+1}/{config['num_epochs']} loss={loss:.4f} val_NDCG@20={val_ndcg20:.4f} (no_improve={no_improve_count})")
 
         if val_ndcg20 > best_val_ndcg:
             best_val_ndcg = val_ndcg20
+            no_improve_count = 0
             best_test_recalls, best_test_ndcgs, best_recalled_pids = evaluate(
                 model, test_dataloader,
                 config['topk_list'], config['beam_size'], device,
@@ -154,6 +158,12 @@ def run_experiment(filter_kwargs, tag, config, device,
                 os.path.join(config['save_dir'], f"{tag}.pth")
             )
             logging.info(f"  new best Recall@10={best_test_recalls['Recall@10']:.4f}")
+        else:
+            no_improve_count += 1
+            if no_improve_count >= config['patience']:
+                logging.info(f"  Early stopping at epoch {epoch+1} (no improvement for {config['patience']} epochs)")
+                print(f"[{tag}] Early stopping at epoch {epoch+1}")
+                break
 
     recalled_pid_coverage = len(best_recalled_pids) / total_pids
     result = {
@@ -186,7 +196,8 @@ def main():
     args = parse_args()
     dc = DATASET_CONFIGS[args.dataset]
     config = {**MODEL_CONFIG, **dc,
-              'num_epochs': args.epochs, 'device': args.device}
+              'num_epochs': args.epochs, 'patience': args.patience,
+              'device': args.device}
 
     os.makedirs(os.path.dirname(dc['log_path']), exist_ok=True)
     logging.basicConfig(
