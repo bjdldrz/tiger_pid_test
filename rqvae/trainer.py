@@ -45,6 +45,14 @@ class Trainer(object):
         self.optimizer = self._build_optimizer()
         self.scheduler = self._get_scheduler()
         self.model = self.model.to(self.device)
+        # Multi-GPU support: wrap with DataParallel if multiple GPUs available
+        if self.device.type == 'cuda' and torch.cuda.device_count() > 1:
+            self.model = torch.nn.DataParallel(self.model)
+            logging.getLogger().info(f"RQ-VAE using {torch.cuda.device_count()} GPUs")
+
+    def _unwrap_model(self):
+        """Return the underlying RQVAE, unwrapping DataParallel if needed."""
+        return self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
 
     def _build_optimizer(self):
 
@@ -112,7 +120,7 @@ class Trainer(object):
             data = data.to(self.device)
             self.optimizer.zero_grad()
             out, rq_loss, indices = self.model(data)
-            loss, loss_recon = self.model.compute_loss(out, rq_loss, xs=data)
+            loss, loss_recon = self._unwrap_model().compute_loss(out, rq_loss, xs=data)
             self._check_nan(loss)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -141,7 +149,7 @@ class Trainer(object):
         for batch_idx, data in enumerate(iter_data):
             num_sample += len(data)
             data = data.to(self.device)
-            indices = self.model.get_indices(data)
+            indices = self._unwrap_model().get_indices(data)
             indices = indices.view(-1,indices.shape[-1]).cpu().numpy()
             for index in indices:
                 code = "-".join([str(int(_)) for _ in index])
@@ -160,7 +168,7 @@ class Trainer(object):
             "epoch": epoch,
             "best_loss": self.best_loss,
             "best_collision_rate": self.best_collision_rate,
-            "state_dict": self.model.state_dict(),
+            "state_dict": self._unwrap_model().state_dict(),
             "optimizer": self.optimizer.state_dict(),
         }
         torch.save(state, ckpt_path, pickle_protocol=4)
