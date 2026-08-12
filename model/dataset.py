@@ -16,11 +16,15 @@ def process_data(file_path, mode, max_len, PAD_TOKEN=0):
     """
     data = pd.read_parquet(file_path, engine='fastparquet')
 
+    has_reward = 'target_reward' in data.columns
     processed_data = []
     for row in data.itertuples(index=False):
         history = list(row.history)
         target  = row.target
-        processed_data.append({'history': history, 'target': target})
+        item = {'history': history, 'target': target}
+        if has_reward:
+            item['target_reward'] = float(row.target_reward)
+        processed_data.append(item)
 
     # Apply padding or truncation
     for item in processed_data:
